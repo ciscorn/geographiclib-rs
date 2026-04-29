@@ -518,4 +518,72 @@ mod tests {
         let (lat, lon, gamma, k) = tm.reverse(nan, 0.0, 0.0);
         assert!(!lat.is_nan() && lon.is_nan() && !gamma.is_nan() && !k.is_nan());
     }
+
+    // Karney's TMcoords.dat fixture. See test_fixtures/README.md.
+    // Rows requiring `TransverseMercatorExact` are skipped.
+    #[test]
+    fn tmcoords_compatibility() {
+        use std::io::BufRead;
+
+        const BUILTIN_TEST_PATH: &str = "test_fixtures/TMcoords-excerpt.dat";
+        const FULL_TEST_PATH: &str = "test_fixtures/test_data_unzipped/TMcoords.dat";
+
+        let full = cfg!(feature = "test_full");
+        let path = if full {
+            FULL_TEST_PATH
+        } else {
+            BUILTIN_TEST_PATH
+        };
+
+        // Karney's TMcoords.dat uses WGS84, central meridian 0, k0 = 0.9996.
+        let tm = TransverseMercator::utm();
+        let file = std::fs::File::open(path).unwrap_or_else(|_| {
+            panic!(
+                "failed to open {}; run script/download-test-data.sh for the full fixture",
+                path
+            )
+        });
+        let reader = std::io::BufReader::new(file);
+
+        for (i, line) in reader.lines().enumerate() {
+            let line_num = i + 1;
+            let line = line.expect("failed to read TMcoords line");
+            let v: Vec<f64> = line
+                .split_whitespace()
+                .map(|s| s.parse::<f64>().expect("failed to parse TMcoords value"))
+                .collect();
+            assert_eq!(v.len(), 6, "line {line_num}");
+            let (lat, lon, x_ref, y_ref, gamma_ref, k_ref) = (v[0], v[1], v[2], v[3], v[4], v[5]);
+
+            // For the full fixture, skip rows from segments we cannot resolve.
+            #[cfg(feature = "test_full")]
+            if !krueger_compatible(line_num, lat, lon) {
+                continue;
+            }
+            #[cfg(not(feature = "test_full"))]
+            let _ = line_num;
+
+            let (x, y, gamma, k) = tm.forward(0.0, lat, lon);
+            assert_relative_eq!(x, x_ref, epsilon = 1e-9, max_relative = 1e-13);
+            assert_relative_eq!(y, y_ref, epsilon = 1e-9, max_relative = 1e-13);
+            assert_relative_eq!(gamma, gamma_ref, epsilon = 1e-14, max_relative = 1e-14);
+            assert_relative_eq!(k, k_ref, max_relative = 1e-15);
+        }
+    }
+
+    /// Returns false for `TMcoords.dat` rows that require `TransverseMercatorExact`
+    /// (not implemented here) and cannot be resolved by the Krueger 6th-order series.
+    #[cfg(feature = "test_full")]
+    fn krueger_compatible(line_num: usize, lat: f64, lon: f64) -> bool {
+        // Segments 7..13 (rows 255001..=287000) cover the Krueger branch cut
+        // and the lat < 0 "extended" domain.
+        if line_num > 255000 {
+            return false;
+        }
+        // Mirror ETA_MAX in script/excerpt-tmcoords.py.
+        let (sphi, cphi) = lat.to_radians().sin_cos();
+        let (slam, clam) = lon.to_radians().sin_cos();
+        let h = f64::hypot(sphi / cphi, clam);
+        (slam.abs() / h).asinh() < 0.5
+    }
 }
