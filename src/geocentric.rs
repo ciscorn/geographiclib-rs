@@ -28,14 +28,17 @@ impl Geocentric {
     /// Create a geocentric converter for the WGS 84 ellipsoid.
     #[inline]
     pub fn wgs84() -> Self {
-        *WGS84_GEOCENTRIC.get_or_init(|| Self::new(WGS84_A, WGS84_F))
+        *WGS84_GEOCENTRIC.get_or_init(|| Self::new_unchecked(WGS84_A, WGS84_F))
     }
 
     /// Create a geocentric converter for an ellipsoid of revolution.
     ///
-    /// `a` is the equatorial radius in meters. `f` is the flattening of the
-    /// ellipsoid. Setting `f = 0` gives a sphere; negative `f` gives a prolate
-    /// ellipsoid.
+    /// Setting `f = 0` gives a sphere; negative `f` gives a prolate ellipsoid.
+    ///
+    /// # Arguments
+    ///
+    /// - `a` - equatorial radius (meters).
+    /// - `f` - flattening of the ellipsoid.
     ///
     /// # Panics
     /// Panics if `a` is not positive and finite, or if `(1 - f) * a` is not
@@ -78,10 +81,17 @@ impl Geocentric {
 
     /// Convert from geodetic coordinates to geocentric coordinates.
     ///
-    /// `lat` and `lon` are in degrees, and `height` is in meters above the
-    /// ellipsoid. `lat` should be in the range `[-90, 90]`.
+    /// # Arguments
     ///
-    /// Returns `(x, y, z)` in meters.
+    ///  - `lat` - latitude (degrees) [-90., 90.]
+    ///  - `lon` - longitude (degrees)
+    ///  - `height` - height above the ellipsoid (meters)
+    ///
+    /// # Returns
+    ///
+    ///  - `x` - geocentric x (meters).
+    ///  - `y` - geocentric y (meters).
+    ///  - `z` - geocentric z (meters).
     #[inline]
     pub fn forward(&self, lat: f64, lon: f64, height: f64) -> (f64, f64, f64) {
         let (sin_phi, cos_phi) = geomath::sincosd(geomath::lat_fix(lat));
@@ -101,8 +111,17 @@ impl Geocentric {
     /// Convert from geodetic coordinates to geocentric coordinates and return a
     /// rotation matrix.
     ///
-    /// The returned matrix is row-major and maps a local east, north, up (ENU)
-    /// vector at `(lat, lon, height)` to a geocentric ECEF vector.
+    /// # Arguments
+    ///
+    ///  - `lat` - latitude (degrees) [-90., 90.]
+    ///  - `lon` - longitude (degrees)
+    ///  - `height` - height above the ellipsoid (meters)
+    ///
+    /// # Returns
+    ///
+    ///  - `(x, y, z)` - geocentric coordinates (meters).
+    ///  - rotation matrix (row-major) mapping a local east, north, up (ENU)
+    ///    vector at `(lat, lon, height)` to a geocentric ECEF vector.
     #[inline]
     pub fn forward_with_rotation(
         &self,
@@ -119,14 +138,21 @@ impl Geocentric {
 
     /// Convert from geocentric coordinates to geodetic coordinates.
     ///
-    /// `x`, `y`, and `z` are geocentric coordinates in meters.
+    /// If multiple geodetic solutions exist, the solution minimizing
+    /// `abs(height)` is returned.  This method is based on Vermeille's method
+    /// with GeographicLib's robustness improvement.
     ///
-    /// Returns `(lat, lon, height)`, where `lat` and `lon` are in degrees and
-    /// `height` is in meters above the ellipsoid. If multiple geodetic
-    /// solutions exist, the solution minimizing `abs(height)` is returned.
+    /// # Arguments
     ///
-    /// This method is based on Vermeille's method with GeographicLib's
-    /// robustness improvement.
+    ///  - `x` - geocentric x (meters).
+    ///  - `y` - geocentric y (meters).
+    ///  - `z` - geocentric z (meters).
+    ///
+    /// # Returns
+    ///
+    ///  - `lat` - latitude (degrees).
+    ///  - `lon` - longitude (degrees).
+    ///  - `height` - height above the ellipsoid (meters).
     #[inline]
     pub fn reverse(&self, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
         let rho = x.hypot(y);
@@ -231,8 +257,17 @@ impl Geocentric {
     /// Convert from geocentric coordinates to geodetic coordinates and return a
     /// rotation matrix.
     ///
-    /// The returned matrix is row-major and maps a local east, north, up (ENU)
-    /// vector at the returned geodetic position to a geocentric ECEF vector.
+    /// # Arguments
+    ///
+    ///  - `x` - geocentric x (meters).
+    ///  - `y` - geocentric y (meters).
+    ///  - `z` - geocentric z (meters).
+    ///
+    /// # Returns
+    ///
+    ///  - `(lat, lon, height)` - geodetic coordinates (degrees, degrees, meters).
+    ///  - rotation matrix (row-major) mapping a local east, north, up (ENU)
+    ///    vector at the returned geodetic position to a geocentric ECEF vector.
     #[inline]
     pub fn reverse_with_rotation(&self, x: f64, y: f64, z: f64) -> ((f64, f64, f64), [f64; 9]) {
         let lla = self.reverse(x, y, z);
@@ -264,108 +299,29 @@ mod tests {
     use approx::{assert_abs_diff_eq, assert_relative_eq};
     use std::io::BufRead;
 
-    const GEOCENTRIC_WGS84_CPP_TEST_PATH: &str = "test_fixtures/geocentric_wgs84_cpp.dat";
+    const GEOCENTRIC_WGS84_TEST_PATH: &str = "test_fixtures/geocentric_wgs84.dat";
 
     #[test]
-    fn roundtrip() {
-        let a = 6378137.;
-        let inv_f = 298.257223563;
-        let f = 1. / inv_f;
-        let b = a * (1. - f);
-        let earth = Geocentric::new(a, f);
-
-        {
-            let (lat, lon, height) = (37., 140., 50.);
-            let (x, y, z) = earth.forward(lat, lon, height);
-            let (lat2, lon2, height2) = earth.reverse(x, y, z);
-            assert!((lat - lat2).abs() < 1e-10);
-            assert!((lon - lon2).abs() < 1e-10);
-            assert!((height - height2).abs() < 1e-7);
-        }
-
-        {
-            let (lat, lon, height) = (74.58501644931525, 45., -6344866.234164982);
-            let (x, y, z) = earth.forward(lat, lon, height);
-            let (lat2, lon2, height2) = earth.reverse(x, y, z);
-            assert!((lat - lat2).abs() < 1e-10);
-            assert!((lon - lon2).abs() < 1e-10);
-            assert!((height - height2).abs() < 1e-7);
-        }
-
-        {
-            let (lat, lon, height) = (88.10828645, 120., -6356728.972246517);
-            let (x, y, _) = earth.forward(lat, lon, height);
-            let z = 0.;
-            let (lat2, lon2, height2) = earth.reverse(x, y, z);
-            assert!((lat - lat2).abs() < 1e-10);
-            assert!((lon - lon2).abs() < 1e-10);
-            assert!((height - height2).abs() < 30.);
-        }
-
-        {
-            let (lat, lon, height) = (-88.10828645, 120., -6356728.972246517);
-            let (x, y, _) = earth.forward(lat, lon, height);
-            let z = -f64::MIN_POSITIVE;
-            let (lat2, lon2, height2) = earth.reverse(x, y, z);
-            assert!((lat - lat2).abs() < 1e-10);
-            assert!((lon - lon2).abs() < 1e-10);
-            assert!((height - height2).abs() < 30.);
-        }
-
-        {
-            let (lat, lon, height) = (90., 0., b);
-            let (x, y, z) = earth.forward(lat, lon, height);
-            let (lat2, lon2, height2) = earth.reverse(x, y, z);
-            assert!((lat - lat2).abs() < 1e-9);
-            assert!((lon - lon2).abs() < 1e-9);
-            assert!((height - height2).abs() < 1e-7);
-        }
-    }
-
-    #[test]
-    fn to_geocentric() {
-        let a = 6378137.;
-        let inv_f = 298.257223563;
-        let f = 1. / inv_f;
-        let b = a * (1. - f);
-        let earth = Geocentric::new(a, f);
-
-        {
-            let (x, y, z) = earth.forward(37., 140., 50.);
-            assert!((x - -3906851.9770472576).abs() < 1e-9);
-            assert!((y - 3278238.0530045824).abs() < 1e-9);
-            assert!((z - 3817423.251099322).abs() < 1e-9);
-        }
-
-        {
-            let height = 150.;
-            let (x, y, z) = earth.forward(90., 123., height);
-            assert!((x - 0.).abs() < 1e-9);
-            assert!((y - 0.).abs() < 1e-9);
-            assert!((z - (b + height)).abs() < 1e-9);
-        }
-
-        {
-            let height = 100.;
-            let (x, y, z) = earth.forward(0., 0., height);
-            assert!((x - (a + height)).abs() < 1e-9);
-            assert!((y - 0.).abs() < 1e-9);
-            assert!((z - 0.).abs() < 1e-9);
-        }
-    }
-
-    #[test]
-    fn sphere_reverse() {
+    fn sphere() {
         let earth = Geocentric::new(10., 0.);
+        assert_eq!(earth.equatorial_radius(), 10.);
         assert_eq!(earth.flattening(), 0.);
 
+        // forward
+        {
+            let (x, y, z) = earth.forward(0., 0., 5.);
+            assert_eq!(x, 15.);
+            assert_eq!(y, 0.);
+            assert_eq!(z, 0.);
+        }
+
+        // reverse
         {
             let (lat, lon, height) = earth.reverse(0., 0., 0.);
             assert_eq!(lat, 90.);
             assert_eq!(lon, 0.);
             assert_eq!(height, -10.);
         }
-
         {
             let (lat, lon, height) = earth.reverse(10., 0., 0.);
             assert_eq!(lat, 0.);
@@ -375,13 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn sphere_forward() {
-        let earth = Geocentric::new(10., 0.);
-        let (x, y, z) = earth.forward(0., 0., 5.);
+    fn reverse_near_origin_with_perturbed_z() {
+        let earth = Geocentric::wgs84();
 
-        assert_eq!(x, 15.);
-        assert_eq!(y, 0.);
-        assert_eq!(z, 0.);
+        for (lat, lon, height, z) in [
+            (88.10828645_f64, 120.0_f64, -6356728.972246517_f64, 0.0_f64),
+            (-88.10828645, 120.0, -6356728.972246517, -f64::MIN_POSITIVE),
+        ] {
+            let (x, y, _) = earth.forward(lat, lon, height);
+            let (lat2, lon2, height2) = earth.reverse(x, y, z);
+            assert!((lat - lat2).abs() < 1e-10);
+            assert!((lon - lon2).abs() < 1e-10);
+            assert!((height - height2).abs() < 30.);
+        }
     }
 
     #[test]
@@ -400,8 +362,10 @@ mod tests {
         assert!(rotation.iter().any(|value| value.is_nan()));
     }
 
+    // Mirrors GeographicLib's CartConvert0 / CartConvert1 regression tests
     #[test]
-    fn geographiclib_cartconvert_reverse_cases() {
+    fn reverse_with_extreme_ellipsoid() {
+        // CartConvert 0: heavily oblate (f = 1/100).
         {
             let earth = Geocentric::new(6.4e6, 1. / 100.);
             let (lat, lon, height) = earth.reverse(10e3, 0., 1e3);
@@ -410,6 +374,7 @@ mod tests {
             assert!((height - -6334614.).abs() < 1.);
         }
 
+        // CartConvert 1: prolate (f = -1/100).
         {
             let earth = Geocentric::new(6.4e6, -1. / 100.);
             let (lat, lon, height) = earth.reverse(1e3, 0., 10e3);
@@ -455,29 +420,26 @@ mod tests {
         assert!((lat - lat2).abs() < 1e-10);
         assert!((lon - lon2).abs() < 1e-10);
         assert!((height - height2).abs() < 1e-7);
+
+        let (lat, lon, height) = earth.reverse(0., 0., 0.);
+        assert_eq!(lat, 0.);
+        assert_eq!(lon, 0.);
+        assert!((height - -6.4e6).abs() < 1.0);
     }
 
     #[test]
     fn forward_with_rotation() {
         let earth = Geocentric::wgs84();
-        let ((x, y, z), m) = earth.forward_with_rotation(0., 0., 0.);
-
-        assert!((x - earth.equatorial_radius()).abs() < 1e-9);
-        assert_eq!(y, 0.);
-        assert_eq!(z, 0.);
+        let (_xyz, m) = earth.forward_with_rotation(0., 0., 0.);
         assert_eq!(m, [-0., -0., 1., 1., -0., 0., 0., 1., 0.]);
     }
 
     #[test]
     fn reverse_with_rotation_matches_forward_rotation() {
         let earth = Geocentric::wgs84();
-        let (lat, lon, height) = (37., 140., 50.);
-        let ((x, y, z), forward_rotation) = earth.forward_with_rotation(lat, lon, height);
-        let ((lat2, lon2, height2), reverse_rotation) = earth.reverse_with_rotation(x, y, z);
+        let ((x, y, z), forward_rotation) = earth.forward_with_rotation(37., 140., 50.);
+        let (_lla, reverse_rotation) = earth.reverse_with_rotation(x, y, z);
 
-        assert!((lat - lat2).abs() < 1e-10);
-        assert!((lon - lon2).abs() < 1e-10);
-        assert!((height - height2).abs() < 1e-7);
         for (forward, reverse) in forward_rotation.iter().zip(reverse_rotation.iter()) {
             assert!((forward - reverse).abs() < 1e-12);
         }
@@ -485,10 +447,10 @@ mod tests {
 
     #[test]
     fn geocentric_cpp_compatibility() {
-        let earth = Geocentric::wgs84();
         // Generated from C++ GeographicLib Geocentric with std::setprecision(17).
-        let file = std::fs::File::open(GEOCENTRIC_WGS84_CPP_TEST_PATH)
-            .expect("failed to open geocentric_wgs84_cpp.dat");
+        let file = std::fs::File::open(GEOCENTRIC_WGS84_TEST_PATH)
+            .expect("failed to open geocentric_wgs84.dat");
+        let earth = Geocentric::wgs84();
         let reader = std::io::BufReader::new(file);
 
         for (i, line) in reader.lines().enumerate() {
