@@ -7,8 +7,6 @@ is organised in 13 segments described at:
   https://geographiclib.sourceforge.io/C++/doc/transversemercator.html#testmerc
 """
 
-from __future__ import annotations
-
 import math
 import sys
 from pathlib import Path
