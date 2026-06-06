@@ -83,8 +83,6 @@ fn remainder(x: f64, y: f64) -> f64 {
 
 /// reduce angle to (-180,180]
 pub fn ang_normalize(x: f64) -> f64 {
-    // y = Math.remainder(x, 360)
-    // return copysign(180, x) if abs(y) == 180 else y
     let y = remainder(x, 360.0);
     if y.abs() == 180.0 {
         180.0_f64.copysign(x)
@@ -198,15 +196,24 @@ pub fn tauf(taup: f64, es: f64) -> f64 {
     if !tau.is_finite() || tau.abs() >= taumax {
         return tau;
     }
+    let mut done = false;
     for _ in 0..NUMIT {
         let taupa = taupf(tau, es);
         let dtau = (taup - taupa) * (1.0 + e2m * tau * tau)
             / (e2m * f64::hypot(1.0, tau) * f64::hypot(1.0, taupa));
         tau += dtau;
-        if dtau.abs() < stol || dtau.is_nan() {
+        if dtau.is_nan() {
+            // NaN propagates through tau; bail out without claiming convergence.
+            break;
+        }
+        if dtau.abs() < stol {
+            done = true;
             break;
         }
     }
+    // GeographicLib uses GEOGRAPHICLIB_PANIC here, which throws only for
+    // multiprecision builds; default double builds exit cleanly.
+    debug_assert!(done, "Convergence failure in tauf");
     tau
 }
 

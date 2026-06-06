@@ -231,14 +231,11 @@ impl TransverseMercator {
             (xip, etap, gamma, k)
         };
 
-        let (sin_2xip, cos_2xip) = (2.0 * xip).sin_cos();
-        let exp_2_etap = (2.0 * etap).exp();
-        let half_inv = 0.5 / exp_2_etap;
-        let sinh_2etap = 0.5 * exp_2_etap - half_inv;
-        let cosh_2etap = 0.5 * exp_2_etap + half_inv;
+        let (s0, c0) = (2.0 * xip).sin_cos();
+        let sh0 = (2.0 * etap).sinh();
+        let ch0 = (2.0 * etap).cosh();
 
-        let ((dxi, deta), (dz_re, dz_im)) =
-            clenshaw(&self.alp, sin_2xip, cos_2xip, sinh_2etap, cosh_2etap);
+        let ((dxi, deta), (dz_re, dz_im)) = clenshaw(&self.alp, s0, c0, sh0, ch0);
         let xi = xip + dxi;
         let eta = etap + deta;
 
@@ -249,14 +246,11 @@ impl TransverseMercator {
     }
 
     fn reverse_inner(&self, xi: f64, eta: f64) -> (f64, f64, f64, f64) {
-        let (sin_2xi, cos_2xi) = (2.0 * xi).sin_cos();
-        let exp_2_eta = (2.0 * eta).exp();
-        let half_inv = 0.5 / exp_2_eta;
-        let sinh_2eta = 0.5 * exp_2_eta - half_inv;
-        let cosh_2eta = 0.5 * exp_2_eta + half_inv;
+        let (s0, c0) = (2.0 * xi).sin_cos();
+        let sh0 = (2.0 * eta).sinh();
+        let ch0 = (2.0 * eta).cosh();
 
-        let ((dxi, deta), (dz_re, dz_im)) =
-            clenshaw(&self.bet, sin_2xi, cos_2xi, sinh_2eta, cosh_2eta);
+        let ((dxi, deta), (dz_re, dz_im)) = clenshaw(&self.bet, s0, c0, sh0, ch0);
         let xip = xi + dxi;
         let etap = eta + deta;
 
@@ -265,15 +259,15 @@ impl TransverseMercator {
 
         let s = etap.sinh();
         // cos(pi/2) might be negative
-        let c_xip = f64::max(0.0, xip.cos());
-        let r = f64::hypot(s, c_xip);
+        let c = f64::max(0.0, xip.cos());
+        let r = f64::hypot(s, c);
 
         let (lat, lon) = if r != 0.0 {
-            let lon = f64::atan2(s, c_xip);
+            let lon = f64::atan2(s, c);
             let sxip = xip.sin();
             let tau = geomath::tauf(sxip / r, self.es);
             // Krueger p 19 (31)
-            gamma += geomath::atan2d(sxip * etap.tanh(), c_xip);
+            gamma += geomath::atan2d(sxip * etap.tanh(), c);
             // Note cos(phi') * cosh(eta') = r
             k *= (self.e2m + self.e2 / (1.0 + tau * tau)).sqrt() * f64::hypot(1.0, tau) * r;
             (tau.atan(), lon)
@@ -308,18 +302,13 @@ fn setup_coefficients(f: f64) -> (f64, Coeffs, Coeffs) {
     (b1, bet, alp)
 }
 
-fn clenshaw(
-    a: &Coeffs,
-    sin_arg_r: f64,
-    cos_arg_r: f64,
-    sinh_arg_i: f64,
-    cosh_arg_i: f64,
-) -> ((f64, f64), (f64, f64)) {
+/// Clenshaw summation of the Krüger series and its derivative.
+fn clenshaw(a: &Coeffs, s0: f64, c0: f64, sh0: f64, ch0: f64) -> ((f64, f64), (f64, f64)) {
     let n = a.len();
 
-    // 2 * cos(2*zeta)
-    let r2 = 2.0 * cos_arg_r * cosh_arg_i;
-    let i2 = -2.0 * sin_arg_r * sinh_arg_i;
+    // (r2, i2) is Karney's `a = 2 * cos(2*zeta)` recurrence multiplier.
+    let r2 = 2.0 * c0 * ch0;
+    let i2 = -2.0 * s0 * sh0;
 
     let (mut y_re, mut y_im) = (a[n - 1], 0.0);
     let (mut y1_re, mut y1_im) = (0.0, 0.0);
@@ -341,14 +330,14 @@ fn clenshaw(
     }
 
     // sin(2*zeta)
-    let sin_re = sin_arg_r * cosh_arg_i;
-    let sin_im = cos_arg_r * sinh_arg_i;
+    let sin_re = s0 * ch0;
+    let sin_im = c0 * sh0;
     let sum_re = sin_re * y_re - sin_im * y_im;
     let sum_im = sin_re * y_im + sin_im * y_re;
 
     // cos(2*zeta)
-    let cos_re = cos_arg_r * cosh_arg_i;
-    let cos_im = -sin_arg_r * sinh_arg_i;
+    let cos_re = c0 * ch0;
+    let cos_im = -s0 * sh0;
     let deriv_re = 1.0 - z1_re + cos_re * z_re - cos_im * z_im;
     let deriv_im = -z1_im + cos_re * z_im + cos_im * z_re;
 
