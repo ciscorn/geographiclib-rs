@@ -12,17 +12,33 @@ use crate::geodesic::{WGS84_A, WGS84_F};
 use crate::geomath;
 
 /// A converter between geodetic coordinates and geocentric coordinates.
+///
+/// This follows GeographicLib's C++ `Geocentric` implementation, which adapts
+/// Vermeille's 2002 reverse transform with Karney's robustness improvements.
+/// The general reverse branch uses Vermeille's 2011 formulas for the cubic
+/// solution while preserving GeographicLib's special-case handling.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geocentric {
     a: f64,
     f: f64,
-    e_sq: f64,
-    e_quad: f64,
-    max_rad: f64,
-    one_minus_e_sq: f64,
+    e2: f64,
+    e2m: f64,
+    e2a: f64,
+    e4a: f64,
+    maxrad: f64,
 }
 
 static WGS84_GEOCENTRIC: sync::OnceLock<Geocentric> = sync::OnceLock::new();
+
+struct ReverseResult {
+    lat: f64,
+    lon: f64,
+    height: f64,
+    sphi: f64,
+    cphi: f64,
+    slam: f64,
+    clam: f64,
+}
 
 impl Geocentric {
     /// Create a geocentric converter for the WGS 84 ellipsoid.
@@ -55,15 +71,17 @@ impl Geocentric {
 
     #[inline]
     const fn new_unchecked(a: f64, f: f64) -> Self {
-        let e_sq = f * (2.0 - f);
-        let one_minus_f = 1.0 - f;
+        let e2 = f * (2.0 - f);
+        let e2m = (1.0 - f) * (1.0 - f);
         Self {
             a,
             f,
-            e_sq,
-            e_quad: e_sq * e_sq,
-            max_rad: 2.0 * a / f64::EPSILON,
-            one_minus_e_sq: one_minus_f * one_minus_f,
+            e2,
+            e2m,
+            // Inline of `e2.abs()`; `f64::abs` is not yet usable from a `const fn`.
+            e2a: if e2 < 0.0 { -e2 } else { e2 },
+            e4a: e2 * e2,
+            maxrad: 2.0 * a / f64::EPSILON,
         }
     }
 
@@ -96,15 +114,11 @@ impl Geocentric {
     pub fn forward(&self, lat: f64, lon: f64, height: f64) -> (f64, f64, f64) {
         let (sin_phi, cos_phi) = geomath::sincosd(geomath::lat_fix(lat));
         let (sin_lam, cos_lam) = geomath::sincosd(lon);
-        let n = if self.e_sq == 0.0 {
-            self.a
-        } else {
-            self.a / (1. - self.e_sq * sin_phi * sin_phi).sqrt()
-        };
+        let n = self.a / (1. - self.e2 * sin_phi * sin_phi).sqrt();
         let r = (n + height) * cos_phi;
         let x = r * cos_lam;
         let y = r * sin_lam;
-        let z = (n * (1. - self.e_sq) + height) * sin_phi;
+        let z = (self.e2m * n + height) * sin_phi;
         (x, y, z)
     }
 
@@ -129,18 +143,27 @@ impl Geocentric {
         lon: f64,
         height: f64,
     ) -> ((f64, f64, f64), [f64; 9]) {
-        let xyz = self.forward(lat, lon, height);
-        let (sin_lam, cos_lam) = geomath::sincosd(lon);
+        // Mirrors the `M != nullptr` path of GeographicLib's `IntForward`.
         let (sin_phi, cos_phi) = geomath::sincosd(geomath::lat_fix(lat));
+        let (sin_lam, cos_lam) = geomath::sincosd(lon);
+        let n = self.a / (1. - self.e2 * sin_phi * sin_phi).sqrt();
+        let r = (n + height) * cos_phi;
+        let x = r * cos_lam;
+        let y = r * sin_lam;
+        let z = (self.e2m * n + height) * sin_phi;
         let rotation = rotation_matrix(sin_phi, cos_phi, sin_lam, cos_lam);
-        (xyz, rotation)
+        ((x, y, z), rotation)
     }
 
     /// Convert from geocentric coordinates to geodetic coordinates.
     ///
-    /// If multiple geodetic solutions exist, the solution minimizing
-    /// `abs(height)` is returned.  This method is based on Vermeille's method
-    /// with GeographicLib's robustness improvement.
+    /// When multiple geodetic solutions exist, the one minimizing `abs(height)`
+    /// is returned.
+    ///
+    /// The branching mirrors GeographicLib's `Geocentric.cpp`.  The cubic in the
+    /// general case uses Vermeille's updated formulas (2011), which are
+    /// algebraically equivalent to GeographicLib's `S`/`disc`/`T` staging while
+    /// avoiding its `T == 0` guard.
     ///
     /// # Arguments
     ///
@@ -155,103 +178,107 @@ impl Geocentric {
     ///  - `height` - height above the ellipsoid (meters).
     #[inline]
     pub fn reverse(&self, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-        let rho = x.hypot(y);
-        let height_to_center = rho.hypot(z);
+        let result = self.reverse_internal(x, y, z);
+        (result.lat, result.lon, result.height)
+    }
 
-        if height_to_center > self.max_rad {
+    #[inline]
+    fn reverse_internal(&self, x: f64, y: f64, z: f64) -> ReverseResult {
+        let mut big_r = x.hypot(y);
+        let mut slam = if big_r != 0.0 { y / big_r } else { 0.0 };
+        let mut clam = if big_r != 0.0 { x / big_r } else { 1.0 };
+        let mut h = big_r.hypot(z);
+        let (mut sphi, cphi);
+
+        if h > self.maxrad {
             // Match GeographicLib's overflow guard: for extremely distant points,
             // treating the earth as a point gives an adequate height approximation.
-            let half_x = x / 2.0;
-            let half_y = y / 2.0;
-            let half_z = z / 2.0;
-            let half_rho = half_x.hypot(half_y);
-            let (sin_lam, cos_lam) = if half_rho != 0.0 {
-                (half_y / half_rho, half_x / half_rho)
-            } else {
-                (0.0, 1.0)
-            };
-            let half_h = half_z.hypot(half_rho);
-            let sin_phi = half_z / half_h;
-            let cos_phi = half_rho / half_h;
-            return (
-                geomath::atan2d(sin_phi, cos_phi),
-                geomath::atan2d(sin_lam, cos_lam),
-                height_to_center,
-            );
-        }
-
-        if self.e_sq == 0.0 {
-            let phi = if height_to_center == 0.0 {
-                90.0
-            } else {
-                geomath::atan2d(z, rho)
-            };
-            let lam = geomath::atan2d(y, x);
-            return (phi, lam, height_to_center - self.a);
-        }
-
-        let prolate = self.e_sq < 0.;
-        let e_abs = self.e_sq.abs();
-        let pa = rho / self.a;
-        let za = z / self.a;
-        let mut p = pa * pa;
-        let mut q = self.one_minus_e_sq * za * za;
-        let r = (p + q - self.e_quad) / 6.;
-        if prolate {
-            core::mem::swap(&mut p, &mut q);
-        }
-        let r3 = r * r * r;
-        let e_quad_p_q = self.e_quad * p * q;
-
-        let evol = 8. * r3 + e_quad_p_q;
-
-        let (sin_phi, cos_phi, h) = if evol > 0. || q != 0. {
-            let u = if evol > 0. {
-                let l = (evol.sqrt() + e_quad_p_q.sqrt()).cbrt();
-                (3. * r * r) / (2. * l * l) + 0.5 * (l + r / l) * (l + r / l)
-            } else {
-                let t = 2. / 3. * e_quad_p_q.sqrt().atan2((-evol).sqrt() + (-8. * r3).sqrt());
-                -4. * r * (t).sin() * (FRAC_PI_6 + t).cos()
-            };
-            let v = (u * u + self.e_quad * q).sqrt();
-            let uv = if u < 0. {
-                self.e_quad * q / (v - u)
-            } else {
-                u + v
-            };
-            let w = (e_abs * (uv - q) / (2. * v)).max(0.);
-            let k = uv / ((w * w + uv).sqrt() + w);
-            let (k1, k2) = if prolate {
-                (k - self.e_sq, k)
-            } else {
-                (k, k + self.e_sq)
-            };
-            let d = k1 * rho / k2;
-            let h = (1. - self.one_minus_e_sq / k1) * d.hypot(z);
-            let big_h = (z / k1).hypot(rho / k2);
-            let sin_phi = (z / k1) / big_h;
-            let cos_phi = (rho / k2) / big_h;
-            (sin_phi, cos_phi, h)
+            big_r = (x / 2.0).hypot(y / 2.0);
+            slam = if big_r != 0.0 { (y / 2.0) / big_r } else { 0.0 };
+            clam = if big_r != 0.0 { (x / 2.0) / big_r } else { 1.0 };
+            let big_h = (z / 2.0).hypot(big_r);
+            sphi = (z / 2.0) / big_h;
+            cphi = big_r / big_h;
+        } else if self.e4a == 0.0 {
+            // Same spherical branch as GeographicLib.  This keeps the origin
+            // mapped to the north pole and avoids underflow in the general case.
+            let big_h = (if h == 0.0 { 1.0 } else { z }).hypot(big_r);
+            sphi = (if h == 0.0 { 1.0 } else { z }) / big_h;
+            cphi = big_r / big_h;
+            h -= self.a;
         } else {
-            let zz = ((if prolate { p } else { self.e_quad - p }) / self.one_minus_e_sq).sqrt();
-            let xx = (if prolate { self.e_quad - p } else { p }).sqrt();
-            let big_h = zz.hypot(xx);
-            let mut sin_phi = zz / big_h;
-            let cos_phi = xx / big_h;
-            if z < 0. {
-                sin_phi = -sin_phi;
+            let mut p = geomath::sq(big_r / self.a);
+            let mut q = self.e2m * geomath::sq(z / self.a);
+            let r = (p + q - self.e4a) / 6.0;
+            // Match GeographicLib: handle prolate spheroids by swapping the
+            // radial and vertical terms before solving the general case.
+            if self.f < 0.0 {
+                core::mem::swap(&mut p, &mut q);
             }
-            let h = -self.a * (if prolate { 1. } else { self.one_minus_e_sq }) * big_h / e_abs;
-            (sin_phi, cos_phi, h)
-        };
 
-        let lam = if rho != 0.0 {
-            geomath::atan2d(y / rho, x / rho)
-        } else {
-            0.0
-        };
+            if !(self.e4a * q == 0.0 && r <= 0.0) {
+                let r3 = r * r * r;
+                let e4pq = self.e4a * p * q;
+                let evol = 8.0 * r3 + e4pq;
 
-        (geomath::atan2d(sin_phi, cos_phi), lam, h)
+                let u = if evol > 0.0 {
+                    // Vermeille (2011) closed form: algebraically equivalent
+                    // to GeographicLib's `r + T + r^2/T`, but avoids the sign
+                    // pick on T^3 and the `T == 0` special case (the two sqrt
+                    // arguments are non-negative and `l > 0` is guaranteed).
+                    let l = (evol.sqrt() + e4pq.sqrt()).cbrt();
+                    (3.0 * r * r) / (2.0 * l * l) + 0.5 * (l + r / l) * (l + r / l)
+                } else {
+                    // Vermeille (2011) trigonometric form for the casus
+                    // irreducibilis; algebraically equivalent to GeographicLib's
+                    // `r + 2*r*cos(ang/3)` branch.
+                    let t = 2.0 / 3.0 * e4pq.sqrt().atan2((-evol).sqrt() + (-8.0 * r3).sqrt());
+                    -4.0 * r * t.sin() * (FRAC_PI_6 + t).cos()
+                };
+
+                let v = (u * u + self.e4a * q).sqrt();
+                let uv = if u < 0.0 {
+                    self.e4a * q / (v - u)
+                } else {
+                    u + v
+                };
+                let w = (self.e2a * (uv - q) / (2.0 * v)).max(0.0);
+                let k = uv / ((uv + w * w).sqrt() + w);
+                let (k1, k2) = if self.f >= 0.0 {
+                    (k, k + self.e2)
+                } else {
+                    (k - self.e2, k)
+                };
+                let d = k1 * big_r / k2;
+                let big_h = (z / k1).hypot(big_r / k2);
+                sphi = (z / k1) / big_h;
+                cphi = (big_r / k2) / big_h;
+                h = (1.0 - self.e2m / k1) * d.hypot(z);
+            } else {
+                // Limit branch matching GeographicLib.  The general formula
+                // would produce 0/0 for the oblate equatorial plane or the
+                // prolate rotation axis.
+                let zz = ((if self.f >= 0.0 { self.e4a - p } else { p }) / self.e2m).sqrt();
+                let xx = (if self.f < 0.0 { self.e4a - p } else { p }).sqrt();
+                let big_h = zz.hypot(xx);
+                sphi = zz / big_h;
+                cphi = xx / big_h;
+                if z < 0.0 {
+                    sphi = -sphi;
+                }
+                h = -self.a * (if self.f >= 0.0 { self.e2m } else { 1.0 }) * big_h / self.e2a;
+            }
+        }
+
+        ReverseResult {
+            lat: geomath::atan2d(sphi, cphi),
+            lon: geomath::atan2d(slam, clam),
+            height: h,
+            sphi,
+            cphi,
+            slam,
+            clam,
+        }
     }
 
     /// Convert from geocentric coordinates to geodetic coordinates and return a
@@ -270,11 +297,9 @@ impl Geocentric {
     ///    vector at the returned geodetic position to a geocentric ECEF vector.
     #[inline]
     pub fn reverse_with_rotation(&self, x: f64, y: f64, z: f64) -> ((f64, f64, f64), [f64; 9]) {
-        let lla = self.reverse(x, y, z);
-        let (sin_lam, cos_lam) = geomath::sincosd(lla.1);
-        let (sin_phi, cos_phi) = geomath::sincosd(lla.0);
-        let rotation = rotation_matrix(sin_phi, cos_phi, sin_lam, cos_lam);
-        (lla, rotation)
+        let result = self.reverse_internal(x, y, z);
+        let rotation = rotation_matrix(result.sphi, result.cphi, result.slam, result.clam);
+        ((result.lat, result.lon, result.height), rotation)
     }
 }
 
